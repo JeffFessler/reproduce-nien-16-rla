@@ -1,0 +1,111 @@
+function [x,rmsd] = ct_os_mom_lalm_c_oracle(...
+    y,A,W,R,x0,...
+    nIter,nBlock,eta,dwls,option,...
+    xref,iROI,iFBP,...
+    iSave,sDir...
+    )
+
+matx2vecx = @(matx) matx(A.imask(:));
+vecx2matx = @(vecx) embed(vecx,A.imask);
+
+iSave = sort(unique(iSave));
+
+x0 = matx2vecx(x0);
+xref = matx2vecx(xref);
+iROI = matx2vecx(iROI);
+iFBP = matx2vecx(iFBP);
+
+np = length(x0);
+nROI = sum(iROI);
+rms = @(d) norm(d(iROI))/sqrt(nROI);
+
+Ai = Gblock(A,nBlock,0);
+iOrder = subset_start(nBlock)';
+proj = @(x) max(x,0).*(1-iFBP)+x0.*iFBP;
+
+if sum(iSave==0)>0
+    fld_write([sDir 'x_iter_0.fld' ],vecx2matx(x0));
+end
+
+lstr = length(num2str(nBlock));
+count = sprintf('[%%%dd/%d]',lstr,nBlock);
+back = repmat('\b',[1 1+lstr+1+lstr+1]);
+
+x = x0;
+iblock = iOrder(end);
+ia = iblock:nBlock:A.odim(end);
+z = nBlock*(Ai{iblock}'*(col(W.arg.diag(:,:,ia)).*(Ai{iblock}*x-col(y(:,:,ia)))));
+g = z;
+
+dx = zeros(np,1,'single');
+dz = zeros(np,1,'single');
+
+i = 1; rho = 1;
+
+switch option
+    case {'max-curv','huber'}
+        dreg = R.denom(R,zeros(np,1,'single'))+eps;
+    otherwise
+        error('option is not available!?');
+end
+
+rmsd = zeros(nIter+1,1);
+rmsd(1) = rms(x-xref);
+
+str.info = sprintf('Start solving X-ray CT image reconstruction problem using OS-mom-LALM-c-oracle (nBlock = %g, eta = %g, option = %s)...\\n',nBlock,eta,option);
+fprintf(str.info);
+str.log = str.info;
+for iter = 1:nIter
+    tic;
+    
+    k = 1;
+    fprintf(['Iter ' num2str(iter) ': ' count],0);
+    for iblock = iOrder
+        xold = x;
+        zold = z;
+        
+        s = rho*z+(1-rho)*g;
+        if strcmp(option,'huber')
+            dreg = R.denom(R,x)+eps;
+        end
+        num = s+R.cgrad(R,x);
+        den = rho*dwls+dreg;
+        
+        % xmid = proj(x-div0(num,den));
+        xmid = proj(x-num./den);
+        r = dwls.*dx-dz;
+        alpha = 2*eta*div0(r'*(xmid-x),r'*dx);
+        
+        % x = proj(x-div0(num-alpha*rho*r,den));
+        x = proj(x-(num-alpha*rho*r)./den);
+        ia = iblock:nBlock:A.odim(end);
+        z = nBlock*(Ai{iblock}'*(col(W.arg.diag(:,:,ia)).*(Ai{iblock}*x-col(y(:,:,ia)))));
+        
+        g = (rho*z+g)/(rho+1);
+        rho = pi/(i+1)*sqrt(1-(pi/(2*i+2))^2);
+        
+        dx = x-xold;
+        dz = z-zold;
+        
+        fprintf([back count],k);
+        k = k+1;
+        i = i+1;
+    end
+    
+    tt = toc;
+    fprintf(' ');
+    str.info = sprintf('RMSD = %g (%g: in %g seconds)\\n',rms(x-xref),iter,tt);
+    fprintf(str.info);
+    str.log = strcat(str.log,str.info);
+    rmsd(iter+1) = rms(x-xref);
+    
+    if sum(iSave==iter)>0
+        fld_write([sDir 'x_iter_' num2str(iter) '.fld' ],vecx2matx(x));
+    end
+end
+
+x = vecx2matx(x);
+
+fid = fopen([sDir 'recon.log'],'wt');
+fprintf(fid,str.log);
+fclose(fid);

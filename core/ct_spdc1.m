@@ -1,0 +1,243 @@
+  function [x, info] = ct_spdc1(x0, Ab, yi, R, varargin)
+%|function [x, info] = ct_spdc1(x0, Ab, yi, R, [options])
+%|
+%| model-based 3d x-ray ct image reconstruction using the stochastic primal-
+%| dual coordinate method with K = sqrt(W)A (see zhang:14:spd) and
+%| accelerated regularizer descent.
+%|
+%| cost(x) = (y-Ax)'W(y-Ax)/2+R(x)
+%|
+%| in
+%|    x0       [nx ny nz]     initial estimate
+%|    Ab       [nd np]        Gblock object from Gcone
+%|    yi       [ns nt na]     measurements (noisy sinogram data)
+%|    R                       penalty object (see Reg1.m), can be []
+%|
+%| option
+%|    niter                   # of iterations (default: 1)
+%|    isave                   indices of images to be saved (default: [])
+%|    path                    path to saved images (default: './')
+%|    wi       [ns nt na]     weighting sinogram (default: [] for uniform)
+%|    voxmax   [1] or [2]     max voxel value, or [min max] (default: [0 inf])
+%|    denom    [np 1]         precomputed denominator
+%|    userfun  @              user defined function handle (see default below)
+%|                            taking arguments (x, userarg{:})
+%|    userarg  {}             user arguments to userfun (default {})
+%|    order                   update order (default: 'rand')
+%|    rho                     al penalty parameter (default: 1)
+%|    theta                   extrapolation parameter (default: 1)
+%|    rate                    regularizer sampling rate (default: 1)
+%|
+%| out
+%|    z        [nx ny nz]     reconstructed image
+%|    info     [niter 1]      outcome of user defined function
+%|
+
+if nargin<4, help(mfilename), error(mfilename), end
+
+% defaults
+arg.niter = 1;
+arg.isave = [];
+arg.path = './';
+arg.userfun = @userfun_default;
+arg.userarg = {};
+arg.voxmax = inf;
+arg.wi = [];
+arg.denom = [];
+arg.order = 'rand';
+arg.rho = 1;
+arg.alpha = 1;
+arg.theta = 1;
+arg.rate = 1;
+arg = vararg_pair(arg,varargin);
+
+Ab = block_op(Ab,'ensure'); % make it a block object (if not already)
+nblock = block_op(Ab,'n');
+np = Ab.np;
+na = Ab.arg.odim(end);
+if Ab.zxy==0 && R.offsets_is_zxy==0
+    tov = @(x) masker(x,Ab.imask); % 3d (xyz) to 1d (xyz)
+    tom = @(x) embed(x,Ab.imask); % 1d (xyz) to 3d (xyz)
+elseif Ab.zxy==1 && R.offsets_is_zxy==1
+    tov = @(x) masker(permute(x,[3 1 2]),Ab.imask); % 3d (xyz) to 1d (zxy)
+    tom = @(x) permute(embed(x,Ab.imask),[2 3 1]); % 1d (zxy) to 3d (xyz)
+else
+    fail 'mismatched order of Ab and R';
+end
+niter = arg.niter;
+
+% statistical weighting matrix
+wi = arg.wi;
+if isempty(wi)
+    wi = ones(size(yi));
+end
+
+% check input sinogram sizes for OS
+if ndims(yi)~=3 || (size(yi,3)==1 && nblock>1)
+    fail 'bad yi size';
+end
+if ndims(wi)~=3 || (size(wi,3)==1 && nblock>1)
+    fail 'bad wi size';
+end
+
+% voxel value limits
+if length(arg.voxmax)==2
+    voxmin = arg.voxmax(1);
+    voxmax = arg.voxmax(2);
+elseif length(arg.voxmax)==1
+    voxmin = 0;
+    voxmax = arg.voxmax;
+else
+    error voxmax;
+end
+
+% likelihood denom, if not provided
+denom = arg.denom;
+if isempty(denom)
+    denom = Ab'*(wi(:).*(Ab*ones(np,1)));
+end
+if ~isnumeric(denom)
+    if strcmp(denom,'max')
+        denom = 0;
+        for ib = 1:nblock
+            ia = ib:nblock:na;
+            denom = max(Ab{ib}'*(col(wi(:,:,ia)).*(Ab{ib}*ones(np,1))),denom);
+        end
+        denom = denom*nblock;
+    else
+        error denom;
+    end
+end
+denom(denom==0) = inf;
+
+% update order
+if ischar(arg.order)
+    switch arg.order
+        case 'fft'
+            ios = @() subset_start(nblock)';
+        case 'rand'
+            ios = @() randi(nblock,[1 nblock]);
+        case 'perm'
+            ios = @() randperm(nblock);
+        case 'seq'
+            ios = @() 1:nblock;
+        otherwise
+            fail 'illegal update order?!';
+    end
+else
+    fail 'illegal update order?!';
+end
+
+% al penalty parameter
+if isnumeric(arg.rho)
+    if arg.rho>0
+        rho = str2func(['@(k)' num2str(arg.rho)]);
+    else
+        fail 'illegal al penalty parameter rho?!';
+    end
+else
+    rho = str2func(arg.rho);
+end
+
+% extrapolation parameter
+if isnumeric(arg.theta)
+    if arg.theta>=0
+        theta = str2func(['@(k)' num2str(arg.theta)]);
+    else
+        fail 'illegal extrapolation parameter theta?!';
+    end
+else
+    theta = str2func(arg.theta);
+end
+
+% regularizer sampling rate
+if isnumeric(arg.theta)
+    if arg.rate>0 && arg.rate<=1
+        rate = str2func(['@(k)' num2str(arg.rate)]);
+    else
+        fail 'illegal regularizer sampling rate?!';
+    end
+else
+    rate = str2func(arg.rate);
+end
+
+if any(arg.isave==0)
+    fld_write([arg.path 'x_iter_0.fld' ],x0);
+end
+
+% progress status
+[count,back] = loop_count_str(nblock);
+
+% initialize variables
+x = min(max(tov(x0),voxmin),voxmax);
+xb = x;
+z = zeros(size(yi),'single');
+u = zeros(np,1,'single');
+
+Rdenom = R.denom(R,ones(np,1,'single'));
+yr = x; gr = R.cgrad(R,yr);
+xrold = x;
+told = 1;
+
+info0 = arg.userfun(x,arg.userarg{:});
+info = zeros(niter,1);
+
+str.info = sprintf('Start solving X-ray CT image reconstruction problem using modified SPDC (nblock = %g)...\\n',nblock);
+fprintf(str.info);
+str.log = str.info;
+
+for iter = 1:niter
+    tic;
+    
+    fprintf(['iter ' num2str(iter) ': ' count],0);
+    iblock = ios();
+    for iset = 1:nblock
+        ib = iblock(iset);
+        ia = ib:nblock:na;
+        k = (iter-1)*nblock+iset;
+        
+        znew = (col(z(:,:,ia))+rho(k)*(col(wi(:,:,ia)).*(Ab{ib}*xb-col(yi(:,:,ia)))))/(1+rho(k));
+        dAz = Ab{ib}'*(znew-col(z(:,:,ia)));
+        z(:,:,ia) = reshape(znew,size(z(:,:,ia)));
+        
+        num = u+dAz*nblock+Rdenom.*(x-yr)+gr;
+        den = rho(k)*denom+Rdenom;
+
+        xold = x;
+        x = min(max(x-num./den,voxmin),voxmax);
+        
+        u = u+dAz;
+        
+        xb = x+theta(k)*(x-xold);
+
+        if rand<=rate(k)
+            t = (1+sqrt(1+4*told^2))/2;
+            beta = (told-1)/t;
+            % beta = 0.9;
+            yr = x+beta*(x-xrold);
+            gr = R.cgrad(R,yr);
+            told = t;
+            xrold = x;
+        end
+        
+        fprintf([back count],iset);
+    end
+    
+    tt = toc;
+    info(iter) = arg.userfun(x,arg.userarg{:});
+    fprintf(' ');
+    str.info = sprintf('info = %g (%g: in %g seconds)\\n',info(iter),iter,tt);
+    fprintf(str.info);
+    str.log = strcat(str.log,str.info);
+    
+    if any(arg.isave==iter)
+        fld_write([arg.path 'x_iter_' num2str(iter) '.fld' ],tom(x));
+    end
+end
+
+x = tom(x);
+info = [info0; info];
+
+fid = fopen([arg.path 'recon.log'],'wt');
+fprintf(fid,str.log);
+fclose(fid);
