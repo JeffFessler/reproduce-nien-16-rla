@@ -1,11 +1,21 @@
 
 https://github.com/JeffFessler/reproduce-nien-16-rla
 
-Code for reproducing the results in the paper
+Code for reproducing the results in the paper:  
 H. Nien and J. A. Fessler,
 "Relaxed linearized algorithms for faster X-ray CT image reconstruction,"
 IEEE Trans. Med. Imag., 35(4):1090-8, Apr. 2026
 https://doi.org/10.1109/TMI.2015.2508780
+
+Please submit a PR if any routines are missing.
+
+Organization:
+- [`script/`](https://github.com/JeffFessler/reproduce-nien-16-rla/tree/main/script)
+main scripts
+- [`core/`](https://github.com/JeffFessler/reproduce-nien-16-rla/tree/main/core)
+many utility functions used by the scripts
+
+It is likely that some editing of matlab `path` will be needed.
 
 
 Notes to future self
